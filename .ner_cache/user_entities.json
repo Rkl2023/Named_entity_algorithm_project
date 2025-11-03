@@ -1,0 +1,20 @@
+{
+  "user_entities": [
+    {
+      "term": "polymer",
+      "type": "MATERIAL"
+    },
+    {
+      "term": "device",
+      "type": "MATERIAL"
+    },
+    {
+      "term": "organic solar cell",
+      "type": "MATERIAL"
+    },
+    {
+      "term": "photovoltaics",
+      "type": "MATERIAL"
+    }
+  ]
+}

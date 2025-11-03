@@ -1,0 +1,11 @@
+{
+  "merged_canonicals": {
+    "side-chain": "SIDE CHAIN",
+    "side-chain engineering": "SIDE CHAIN",
+    "side chain engineering": "SIDE CHAIN",
+    "ORGANIC FIELD EFFECT TRANSISTOR": "OFET",
+    "ORGANIC ELECTROCHEMICAL TRANSISTOR": "OECT",
+    "PHOTOVOLTAIC": "OPV",
+    "ORGANIC SOLAR CELL": "OPV"
+  }
+}
