@@ -38,13 +38,13 @@ It supports upload from Excel sheets and provides:
 ---
 
 ## 📚 Table of Contents
-- [Prerequisites](#prerequisites)
-- [Quick Start](#quick-start)
-- [Step-by-Step Installation](#step-by-step-installation)
-- [Using the App](#using-the-app)
-- [Troubleshooting](#troubleshooting)
-- [Screenshots](#screenshots)
-- [Contributing](#contributing)
+- [Prerequisites](#-prerequisites)
+- [Quick Start](#-quick-start)
+- [Step-by-Step Installation](#%EF%B8%8F-step-by-step-installation)
+- [Using the App](#%EF%B8%8F-using-the-app)
+- [Troubleshooting](#-troubleshooting)
+- [Screenshots](#-example-screenshots)
+- [Contributing](#-contributing)
 
 ---
 
