@@ -59,6 +59,8 @@ cd Named_entity_algorithm_project
 python3 install.py
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 streamlit run app.py
+```
+
 ## 🛠️ Step-by-Step Installation
 
 ### 1. Clone the project
