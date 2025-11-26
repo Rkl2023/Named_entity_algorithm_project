@@ -4,6 +4,12 @@
 
 <h1 align="center">🔬 Scientific Named Entity Explorer</h1>
 
+<!-- The following Markdown heading is intentionally hidden to fix GitHub TOC anchor generation -->
+<!--
+# Scientific Named Entity Explorer
+-->
+
+
 <p align="center">
   Interactive Streamlit app for mining scientific literature using pretrained Named-Entity-Recognition (NER) models.
 </p>
@@ -37,7 +43,7 @@ It supports upload from Excel sheets and provides:
 - [Step-by-Step Installation](#step-by-step-installation)
 - [Using the App](#using-the-app)
 - [Troubleshooting](#troubleshooting)
-- [Screenshots](#example-screenshots)
+- [Screenshots](#screenshots)
 - [Contributing](#contributing)
 
 ---
