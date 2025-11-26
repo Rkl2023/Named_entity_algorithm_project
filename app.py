@@ -31,6 +31,7 @@ import urllib.request
 import urllib.error
 import builtins
 import inspect
+import math
 from functools import wraps
 from collections import Counter, defaultdict
 from collections.abc import Iterable as IterableABC, Mapping
@@ -571,7 +572,7 @@ ENTITY_COLORS = {
     "MATERIAL_AMOUNT": "#0EA5E9",
     "MONOMER": "#22C55E",
     "O": "#9CA3AF",
-    "ORGANIC": "#00FF00",
+    "ORGANIC": "#008000",
     "POLYMER": "#EF4444",
     "POLYMER_FAMILY": "#9333EA",
     "PROP_NAME": "#F59E0B",
@@ -1897,9 +1898,12 @@ def filter_by_entity_type(entity_df: pd.DataFrame, selected_types: Iterable[str]
     if entity_df.empty:
         return entity_df
     allowed = {str(t) for t in selected_types if str(t).strip()}
-    if not allowed:
-        return entity_df.iloc[0:0].copy()
-    filtered = entity_df[entity_df["entity_type"].isin(allowed)].copy()
+    full_allowed = set(ENTITY_TYPES) | set(CUSTOM_ENTITY_TYPES)
+    if allowed:
+        full_allowed |= allowed
+    filtered = entity_df[
+        entity_df["entity_type"].isin(full_allowed) | entity_df.get("is_user_entity", False)
+    ].copy()
     return filtered
 
 
@@ -1973,6 +1977,14 @@ def inject_user_entities(
     paper_text_map: Mapping[int, object],
     user_terms: Iterable[object],
 ) -> Tuple[pd.DataFrame, Dict[int, List[Dict[str, str]]]]:
+    def _normalize_match_strings(value: object) -> Tuple[str, str]:
+        base = _clean_term(value).lower()
+        if not base:
+            return "", ""
+        spaced = re.sub(r"[\s\-\u2010-\u2015]+", " ", base).strip()
+        compact = re.sub(r"[\s\-\u2010-\u2015]+", "", base)
+        return spaced, compact
+
     normalized_map: Dict[str, Dict[str, str]] = {}
     order: List[str] = []
     for entry in user_terms or []:
@@ -1987,11 +1999,23 @@ def inject_user_entities(
     if not cleaned_terms or not paper_text_map:
         return entity_df, {}
     if entity_df.empty:
-        base_columns = ["paper_id", "entity", "entity_norm", "entity_type", "confidence", "is_unknown"]
+        base_columns = [
+            "paper_id",
+            "entity",
+            "entity_norm",
+            "entity_type",
+            "confidence",
+            "is_unknown",
+            "is_user_entity",
+            "start",
+            "end",
+        ]
         working = pd.DataFrame(columns=base_columns)
     else:
         working = entity_df.copy()
-    existing: Set[Tuple[int, str]] = set()
+    if "is_user_entity" not in working.columns:
+        working["is_user_entity"] = False
+    existing: Set[Tuple[int, str, Optional[int]]] = set()
     if not working.empty and "paper_id" in working.columns and "entity" in working.columns:
         for _, row in working.iterrows():
             try:
@@ -1999,9 +2023,16 @@ def inject_user_entities(
             except Exception:
                 continue
             entity_value = _clean_term(row.get("entity"))
-            if not entity_value:
+            norm_spaced, norm_compact = _normalize_match_strings(entity_value)
+            normalized_key = norm_compact or norm_spaced
+            if not normalized_key:
                 continue
-            existing.add((pid, entity_value.lower()))
+            start_val = row.get("start")
+            try:
+                start_val = int(start_val) if start_val is not None and str(start_val).strip() != "" else None
+            except Exception:
+                start_val = None
+            existing.add((pid, normalized_key, start_val))
     additions: List[Dict[str, object]] = []
     per_paper: Dict[int, List[Dict[str, str]]] = defaultdict(list)
     for raw_pid, text in paper_text_map.items():
@@ -2009,34 +2040,53 @@ def inject_user_entities(
             paper_id = int(raw_pid)
         except Exception:
             continue
+        # FIXED: user-defined entities now match dashed/compact variants and show up downstream
         haystack = _clean_term(text).lower()
         if not haystack:
             continue
+        haystack = re.sub(r"[\u2010-\u2015]", "-", haystack)
         for entry in cleaned_terms:
             term_text = entry["term"]
-            term_lower = term_text.lower()
-            if term_lower not in haystack:
+            term_spaced, term_compact = _normalize_match_strings(term_text)
+            normalized_key = term_compact or term_spaced
+            if not normalized_key:
                 continue
-            key = (paper_id, term_lower)
-            if key in existing:
-                if not any(item["term"].lower() == term_lower for item in per_paper[paper_id]):
-                    per_paper[paper_id].append({"term": term_text, "type": entry["type"]})
+            tokens = [tok for tok in term_spaced.split(" ") if tok]
+            if not tokens:
                 continue
-            entity_type_value = canonicalize_label(entry["type"]) or "O"
-            if entity_type_value not in ENTITY_TYPES:
-                entity_type_value = "O"
-            additions.append(
-                {
-                    "paper_id": paper_id,
-                    "entity": term_text,
-                    "entity_norm": normalize_entity(term_text),
-                    "entity_type": entity_type_value,
-                    "confidence": 1.0,
-                    "is_unknown": False,
-                }
-            )
-            existing.add(key)
-            per_paper[paper_id].append({"term": term_text, "type": entity_type_value})
+            separator = r"[\s\-\u2010-\u2015]*"
+            pattern_body = separator.join(re.escape(tok) for tok in tokens)
+            pattern = re.compile(rf"(?<!\w){pattern_body}(?:es|s)?(?!\w)", flags=re.IGNORECASE)
+            # FIXED: user entities now include start/end offsets for relationship extraction.
+            for match in pattern.finditer(haystack):
+                start_idx = match.start()
+                end_idx = match.end()
+                key = (paper_id, normalized_key, start_idx)
+                if key in existing:
+                    if not any(
+                        _normalize_match_strings(item["term"])[1] == normalized_key
+                        for item in per_paper[paper_id]
+                    ):
+                        per_paper[paper_id].append({"term": term_text, "type": entry["type"]})
+                    continue
+                entity_type_value = canonicalize_label(entry["type"]) or "O"
+                if entity_type_value not in ENTITY_TYPES:
+                    entity_type_value = "O"
+                additions.append(
+                    {
+                        "paper_id": paper_id,
+                        "entity": term_text,
+                        "entity_norm": normalize_entity(term_text),
+                        "entity_type": entity_type_value,
+                        "confidence": 1.0,
+                        "is_unknown": False,
+                        "is_user_entity": True,
+                        "start": start_idx,
+                        "end": end_idx,
+                    }
+                )
+                existing.add(key)
+                per_paper[paper_id].append({"term": term_text, "type": entity_type_value})
     if not additions:
         return working, per_paper
     addition_df = pd.DataFrame(additions)
@@ -2132,7 +2182,6 @@ def refresh_active_results_with_user_settings() -> None:
         drop_duplicates=ENABLE_DEDUPLICATION,
     )
     entity_df = sanitize_entity_dataframe(entity_df)
-    entity_df = correct_unit_mislabels(entity_df)
     entity_df = filter_false_units(entity_df)
     entity_df = suppress_lonely_units(entity_df)
     entity_df = trim_and_filter_entities(entity_df)
@@ -2203,6 +2252,16 @@ def sanitize_entity_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df.copy()
     sanitized = sanitize_entities_output(df.copy())
+    user_rows = pd.DataFrame()
+    if "is_user_entity" in sanitized.columns:
+        sanitized["is_user_entity"] = (
+            sanitized["is_user_entity"]
+            .astype(str)
+            .str.lower()
+            .isin({"true", "1", "yes", "y"})
+        )
+        user_rows = sanitized[sanitized["is_user_entity"] == True].copy()
+        sanitized = sanitized[sanitized["is_user_entity"] != True].copy()
     if "entity" in sanitized.columns:
         sanitized = sanitized[sanitized["entity"].str.strip() != ""]
     if "canonical_display" in sanitized.columns:
@@ -2212,11 +2271,36 @@ def sanitize_entity_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     for column in ("entity", "entity_norm", "entity_type", "canonical", "Canonical", "Type"):
         if column in sanitized.columns:
             sanitized[column] = sanitized[column].astype(str)
+    if "is_user_entity" in sanitized.columns:
+        sanitized["is_user_entity"] = sanitized["is_user_entity"].fillna(False).astype(bool)
     type_column = next((col for col in ("Type", "entity_type", "EntityType") if col in sanitized.columns), None)
+    if "entity" in sanitized.columns and "canonical" not in sanitized.columns:
+        if "entity_norm" in sanitized.columns:
+            sanitized["canonical"] = sanitized["entity_norm"].astype(str)
+        else:
+            sanitized["canonical"] = sanitized["entity"].astype(str)
+    if "canonical" in sanitized.columns and "Canonical" not in sanitized.columns:
+        sanitized["Canonical"] = sanitized["canonical"].astype(str).str.upper()
     if type_column:
         sanitized[type_column] = sanitized[type_column].apply(lambda value: canonicalize_label(value, warn=True))
         sanitized["entity_type"] = sanitized[type_column]
         sanitized["Type"] = sanitized[type_column]
+        fallback_mask = sanitized[type_column].astype(str).str.upper().isin({"PROP_VALUE", "MATERIAL_AMOUNT"})
+        if "entity" in sanitized.columns and "canonical" in sanitized.columns:
+            sanitized.loc[fallback_mask, "canonical"] = sanitized.loc[fallback_mask, "entity"].astype(str)
+        if "entity" in sanitized.columns and "Canonical" in sanitized.columns:
+            sanitized.loc[fallback_mask, "Canonical"] = sanitized.loc[fallback_mask, "entity"].astype(str)
+    if not user_rows.empty:
+        sanitized = pd.concat([sanitized, user_rows], ignore_index=True, sort=False)
+        # FIXED: ensure user-injected entities retain canonical/type fields through sanitization
+        if "canonical" in sanitized.columns:
+            if "entity_norm" in sanitized.columns:
+                sanitized["canonical"] = sanitized["canonical"].fillna(sanitized["entity_norm"])
+            sanitized["canonical"] = sanitized["canonical"].fillna(sanitized["entity"])
+        if "Canonical" in sanitized.columns and "canonical" in sanitized.columns:
+            sanitized["Canonical"] = sanitized["Canonical"].fillna(sanitized["canonical"].astype(str).str.upper())
+        if "Type" in sanitized.columns and "entity_type" in sanitized.columns:
+            sanitized["Type"] = sanitized["Type"].fillna(sanitized["entity_type"])
     sanitized = sanitized.reset_index(drop=True)
     if ENABLE_DEDUPLICATION:
         sanitized = sanitized.drop_duplicates().reset_index(drop=True)
@@ -2239,9 +2323,9 @@ def build_property_value_unit_table(
     max_value_gap: int = 40,
     max_property_gap: int = 80,
 ) -> pd.DataFrame:
-    """Return a DataFrame of PROPERTY–VALUE–UNIT triples per paper."""
+    """Return a simplified PROPERTY–VALUE table including value/context details."""
     pandas_module = globals().get("pd")
-    columns = ["paper_id", "PropertyEntity", "ValueEntity", "UnitEntity", "Measurement"]
+    columns = ["Property", "Value", "Context", "Source"]
     if pandas_module is None:
         if DEBUG_MODE:
             debug_log("[PropertyValueUnit] pandas unavailable; returning empty table.")
@@ -2260,130 +2344,65 @@ def build_property_value_unit_table(
         if DEBUG_MODE:
             debug_log("[PropertyValueUnit] Missing entity type column; aborting.")
         return pandas_module.DataFrame(columns=columns)
-    if "start" not in entity_df.columns or "end" not in entity_df.columns:
-        if DEBUG_MODE:
-            debug_log("[PropertyValueUnit] Missing character offsets; aborting.")
+    if "paper_id" not in entity_df.columns:
         return pandas_module.DataFrame(columns=columns)
 
     df = entity_df.copy()
-    df["_start_num"] = pandas_module.to_numeric(df["start"], errors="coerce")
-    df["_end_num"] = pandas_module.to_numeric(df["end"], errors="coerce")
-    df["_type_canonical"] = df[type_column].apply(canonicalize_label)
+    df[type_column] = df[type_column].apply(canonicalize_label)
+    if df.empty:
+        return pandas_module.DataFrame(columns=columns)
 
-    max_value_gap = max(0, int(max_value_gap or 0))
-    max_property_gap = max(max_property_gap, max_value_gap)
+    def _context_for(row: pd.Series) -> Optional[str]:
+        for key in ("context", "Context", "sentence", "Sentence", "source_sentence"):
+            if key in row and isinstance(row.get(key), str) and row.get(key).strip():
+                return str(row.get(key)).strip()
+        return None
 
-    def _is_valid_unit(text: str) -> bool:
-        cleaned = str(text or "").strip()
-        if not cleaned or len(cleaned) > 20:
-            return False
-        if UNIT_ONLY_PATTERN.match(cleaned):
-            return True
-        if cleaned.upper() in UNIT_TERMS:
-            return True
-        return bool(re.fullmatch(r"[A-Za-z0-9µμ%°·^/\\\-\.\s]+", cleaned))
-
-    triples: List[Dict[str, object]] = []
-
+    rows: List[Dict[str, object]] = []
     for paper_id, group_df in df.groupby("paper_id", sort=False):
-        value_rows = group_df[group_df["_type_canonical"] == "PROP_VALUE"]
-        unit_rows = value_rows[value_rows["entity"].astype(str).str.match(UNIT_ONLY_PATTERN)]
-        property_rows = group_df[group_df["_type_canonical"] == "PROP_NAME"]
+        prop_rows = group_df[group_df[type_column] == "PROP_NAME"]
+        value_rows = group_df[group_df[type_column].isin({"PROP_VALUE", "MATERIAL_AMOUNT"})]
 
-        if value_rows.empty:
-            continue
+        for _, val_row in value_rows.iterrows():
+            val_text = str(val_row.get("entity", "")).strip()
+            context_text = _context_for(val_row)
+            best_property = None
 
-        for _, value_row in value_rows.iterrows():
-            v_start = value_row["_start_num"]
-            v_end = value_row["_end_num"]
-            if pandas_module.isna(v_start) or pandas_module.isna(v_end):
-                continue
-            try:
-                v_start_int = int(v_start)
-                v_end_int = int(v_end)
-            except (TypeError, ValueError):
-                continue
-
-            # Find best unit near the value
-            best_unit_text: Optional[str] = None
-            best_unit_choice: Optional[Tuple[int, int, int, int]] = None
-            for _, unit_row in unit_rows.iterrows():
-                unit_text = str(unit_row["entity"]).strip()
-                if not _is_valid_unit(unit_text):
-                    continue
-                u_start = unit_row["_start_num"]
-                u_end = unit_row["_end_num"]
-                if pandas_module.isna(u_start) or pandas_module.isna(u_end):
-                    continue
+            if not prop_rows.empty and "start" in val_row and "start" in prop_rows.columns:
                 try:
-                    u_start_int = int(u_start)
-                    u_end_int = int(u_end)
-                except (TypeError, ValueError):
-                    continue
-                if u_start_int >= v_end_int:
-                    direction = 0
-                    gap = u_start_int - v_end_int
-                elif u_end_int <= v_start_int:
-                    direction = 1
-                    gap = v_start_int - u_end_int
-                else:
-                    direction = 0
-                    gap = 0
-                if gap > max_value_gap:
-                    continue
-                proximity = abs((u_start_int + u_end_int) // 2 - (v_start_int + v_end_int) // 2)
-                tie_breaker = abs(u_start_int - v_end_int)
-                candidate = (direction, gap, proximity, tie_breaker)
-                if best_unit_choice is None or candidate < best_unit_choice:
-                    best_unit_choice = candidate
-                    best_unit_text = unit_text
+                    v_start = int(pandas_module.to_numeric(val_row.get("start"), errors="coerce"))
+                except Exception:
+                    v_start = None
+                if v_start is not None and not pandas_module.isna(v_start):
+                    prop_rows["_start_num"] = pandas_module.to_numeric(prop_rows["start"], errors="coerce")
+                    prop_rows["_start_num"] = prop_rows["_start_num"].fillna(prop_rows["_start_num"].max())
+                    prop_rows["_dist"] = (prop_rows["_start_num"] - v_start).abs()
+                    nearest = prop_rows.sort_values("_dist").head(1)
+                    if not nearest.empty:
+                        prop_row = nearest.iloc[0]
+                        best_property = str(prop_row.get("canonical", prop_row.get("entity", ""))).strip() or None
 
-            value_text = str(value_row["entity"]).strip()
-            measurement = value_text if not best_unit_text else f"{value_text} {best_unit_text}".strip()
-
-            # Find best property within property window
-            best_property_text: Optional[str] = None
-            best_property_distance: Optional[int] = None
-            if not property_rows.empty:
-                for _, prop_row in property_rows.iterrows():
-                    p_start = prop_row["_start_num"]
-                    p_end = prop_row["_end_num"]
-                    if pandas_module.isna(p_start) or pandas_module.isna(p_end):
-                        continue
-                    try:
-                        p_start_int = int(p_start)
-                        p_end_int = int(p_end)
-                    except (TypeError, ValueError):
-                        continue
-                    property_mid = (p_start_int + p_end_int) // 2
-                    value_mid = (v_start_int + v_end_int) // 2
-                    distance = abs(property_mid - value_mid)
-                    if distance > max_property_gap:
-                        continue
-                    if best_property_distance is None or distance < best_property_distance:
-                        best_property_distance = distance
-                        best_property_text = str(prop_row["entity"]).strip()
-
-            triples.append(
+            rows.append(
                 {
-                    "paper_id": paper_id,
-                    "PropertyEntity": best_property_text,
-                    "ValueEntity": value_text,
-                    "UnitEntity": best_unit_text,
-                    "Measurement": measurement,
-                    "_value_start": v_start_int,
+                    "Property": best_property,
+                    "Value": val_text if val_text else None,
+                    "Context": context_text,
+                    "Source": paper_id,
                 }
             )
 
-    if not triples:
-        return pandas_module.DataFrame(columns=columns)
+        if value_rows.empty:
+            for _, prop_row in prop_rows.iterrows():
+                rows.append(
+                    {
+                        "Property": str(prop_row.get("canonical", prop_row.get("entity", ""))).strip(),
+                        "Value": None,
+                        "Context": _context_for(prop_row),
+                        "Source": paper_id,
+                    }
+                )
 
-    pvu_df = pandas_module.DataFrame(triples)
-    if "_value_start" in pvu_df.columns:
-        pvu_df = pvu_df.sort_values(["paper_id", "_value_start"]).drop(columns=["_value_start"])
-    else:
-        pvu_df = pvu_df.sort_values(["paper_id"])
-    return pvu_df.reset_index(drop=True)
+    return pandas_module.DataFrame(rows, columns=columns)
 
 
 def trim_and_filter_entities(
@@ -2402,6 +2421,11 @@ def trim_and_filter_entities(
         return entity_df
 
     df = entity_df.copy()
+    if "is_user_entity" in df.columns:
+        user_rows = df[df["is_user_entity"] == True].copy()
+        df = df[df["is_user_entity"] != True].copy()
+    else:
+        user_rows = pd.DataFrame()
     trailing_stopwords = {
         "and",
         "with",
@@ -2440,6 +2464,8 @@ def trim_and_filter_entities(
     trimmed_count = 0
 
     for idx, row in df.iterrows():
+        if bool(row.get("is_user_entity", False)):
+            continue
         raw_entity = str(row.get("entity", ""))
         if not raw_entity.strip():
             removed_indices.append(idx)
@@ -2482,6 +2508,9 @@ def trim_and_filter_entities(
     if removed_indices:
         df = df.drop(index=removed_indices)
 
+    if not user_rows.empty:
+        df = pd.concat([df, user_rows], ignore_index=True, sort=False)
+
     removed_count = len(removed_indices) + trimmed_count
     if st is not None and removed_count:
         try:
@@ -2505,107 +2534,10 @@ PROPERTY_HINTS = {
 UNIT_PATTERN = re.compile(r"[%°A-Za-zµμΩ/·0-9^+-]+$", re.IGNORECASE)
 
 
-def correct_unit_mislabels(entity_df: pd.DataFrame) -> pd.DataFrame:
-    """Detect and fix PROP_VALUE entities mislabeled from unit-style tokens."""
-
-    pandas_module = globals().get("pd")
-    if pandas_module is None or entity_df is None or entity_df.empty:
-        return entity_df
-    if "entity" not in entity_df.columns:
-        return entity_df
-
-    type_column = next((col for col in ("EntityType", "entity_type", "Type") if col in entity_df.columns), None)
-    if type_column is None:
-        return entity_df
-
-    df = entity_df.copy()
-    df[type_column] = df[type_column].apply(canonicalize_label)
-    corrections = 0
-    additions: List[Dict[str, object]] = []
-
-    for idx, row in df.iterrows():
-        entity_text = str(row.get("entity", "")).strip()
-        if not entity_text:
-            continue
-
-        current_type = canonicalize_label(row.get(type_column, ""))
-        base_row = row.to_dict()
-        matches = re.match(r"^(?P<head>[^()]+)\((?P<inner>[^()]+)\)$", entity_text)
-        if matches:
-            head = matches.group("head").strip().strip("-:")
-            inner = matches.group("inner").strip()
-            if head:
-                corrections += 1
-                new_row = base_row.copy()
-                new_row["entity"] = head
-                new_row[type_column] = "PROP_NAME"
-                additions.append(new_row)
-            if inner:
-                corrections += 1
-                new_row = base_row.copy()
-                new_row["entity"] = inner
-                new_row[type_column] = "PROP_VALUE" if UNIT_PATTERN.match(inner) else current_type
-                additions.append(new_row)
-            continue
-
-        if current_type == "PROP_VALUE":
-            lowered = entity_text.lower()
-            if any(keyword in lowered for keyword in PROPERTY_HINTS):
-                df.at[idx, type_column] = "PROP_NAME"
-                corrections += 1
-
-            elif not UNIT_PATTERN.match(entity_text):
-                df.at[idx, type_column] = "PROP_NAME"
-                corrections += 1
-
-    if additions:
-        df = pandas_module.concat([df, pandas_module.DataFrame(additions)], ignore_index=True)
-
-    if st is not None and corrections:
-        try:
-            st.info(f"🔧 Corrected {corrections} misclassified PROP_VALUE entities.")
-        except Exception:
-            pass
-
-    return df.reset_index(drop=True)
-
 
 def filter_false_units(entity_df: pd.DataFrame) -> pd.DataFrame:
-    """Reclassify unlikely UNIT entities as OTHER using a strict regex whitelist."""
-
-    pandas_module = globals().get("pd")
-    if pandas_module is None or entity_df is None or entity_df.empty:
-        return entity_df
-
-    df = entity_df.copy()
-    type_candidates = ("EntityType", "entity_type", "Type", "label", "Label", "Entity_Type")
-    entity_type_col = next((col for col in type_candidates if col in df.columns), None)
-    if entity_type_col is None:
-        raise KeyError(f"Entity type column not found. Available columns: {list(df.columns)}")
-    if "entity" not in df.columns:
-        raise KeyError(f"Missing required 'entity' column. Available columns: {list(df.columns)}")
-
-    df[entity_type_col] = df[entity_type_col].apply(canonicalize_label)
-
-    mask = df[entity_type_col] == "PROP_VALUE"
-    unit_like_mask = mask & df["entity"].astype(str).str.match(UNIT_ONLY_PATTERN)
-    if not unit_like_mask.any():
-        return df
-
-    VALID_UNIT_PATTERN = re.compile(r"^(%|°[CFK]?|[munp]?[A-Za-z]{1,3}[0-9^/·\-]*)$", flags=re.IGNORECASE)
-    valid_mask = df.loc[unit_like_mask, "entity"].astype(str).str.match(VALID_UNIT_PATTERN)
-    to_reclassify_index = df.loc[unit_like_mask].index[~valid_mask.fillna(False)]
-
-    if not to_reclassify_index.empty:
-        df.loc[to_reclassify_index, entity_type_col] = "O"
-        removed = int(len(to_reclassify_index))
-        if st is not None:
-            try:
-                st.info(f"⚙️ Reclassified {removed} unlikely unit-like entities.")
-            except Exception:
-                pass
-
-    return df
+    """Pass-through: unit-like reclassification disabled."""
+    return entity_df
 
 
 def suppress_lonely_units(entity_df: pd.DataFrame, distance_threshold: int = 50) -> pd.DataFrame:
@@ -3011,27 +2943,22 @@ def chunk_text(
     return chunks
 
 
-def normalize_entity(entity: str) -> str:
-    if not entity:
+def canonicalize_entity(entity: object) -> str:
+    if entity is None:
         return ""
-    entity = re.sub(r"[\u2010-\u2015]", "-", entity)
-    cleaned = re.sub(r"[^A-Za-z0-9\s\-/]", " ", entity).lower()
-    cleaned = cleaned.replace("-", " ")
-    tokens = re.split(r"[\s/]+", cleaned)
-    normalized_tokens: List[str] = []
-    for token in tokens:
-        token = token.strip()
-        if not token:
-            continue
-        token_upper = token.upper()
-        base_upper = token_upper[:-1] if token_upper.endswith("S") and len(token_upper) > 3 else token_upper
-        if base_upper in ACRONYM_UPPER:
-            normalized_tokens.append(base_upper.lower())
-            continue
-        if len(token) > 3 and token.endswith("s"):
-            token = token[:-1]
-        normalized_tokens.append(token)
-    return " ".join(normalized_tokens)
+    if isinstance(entity, bytes):
+        try:
+            entity = entity.decode("utf-8", errors="ignore")
+        except Exception:
+            entity = str(entity)
+    if not isinstance(entity, str):
+        entity = str(entity)
+    return entity.strip()
+
+
+def normalize_entity(entity: str) -> str:
+    """Retain entity text with punctuation/symbols; only trim surrounding whitespace."""
+    return canonicalize_entity(entity)
 
 
 def extract_abbrev_pairs(text: str) -> Dict[str, str]:
@@ -3322,7 +3249,10 @@ def link_entities_fast(
     if progress_callback:
         progress_callback(0.05)
 
+    skip_types = {"PROP_VALUE", "MATERIAL_AMOUNT"}
     df = sanitized_input.copy()
+    excluded = df[df["entity_type"].astype(str).str.upper().isin(skip_types)].copy()
+    df = df[~df["entity_type"].astype(str).str.upper().isin(skip_types)].copy()
     df["norm"] = df["entity"].apply(normalize_entity)
     freq_map = Counter(df["norm"])
     unique_norms = tuple(sorted({norm for norm in df["norm"] if norm}))
@@ -3342,10 +3272,17 @@ def link_entities_fast(
     if progress_callback:
         progress_callback(0.6)
 
+    base_threshold = 0.80
+    if len(df) > 0:
+        try:
+            base_threshold = 0.80 + min(0.05, 0.02 * math.log10(max(len(df) / 1000, 1e-6)))
+        except Exception:
+            base_threshold = 0.80
+
     canonical_map, alias_groups = _build_cluster_maps(
         unique_norms,
         similarity_lookup,
-        base_threshold=0.85,
+        base_threshold=base_threshold,
         abbreviation_links=abbreviation_links,
         freq_map=freq_map,
         type_lookup=type_lookup,
@@ -3370,6 +3307,14 @@ def link_entities_fast(
 
     df = apply_user_canonical_overrides(df, user_canonical)
     df = sanitize_entity_dataframe(df)
+    if not excluded.empty:
+        if "norm" not in excluded.columns:
+            excluded["norm"] = excluded["entity"].apply(normalize_entity)
+        if "canonical" not in excluded.columns:
+            excluded["canonical"] = excluded["norm"]
+        if "Canonical" not in excluded.columns:
+            excluded["Canonical"] = excluded["canonical"].apply(lambda val: str(val).strip().upper())
+        df = pd.concat([df, excluded], ignore_index=True, sort=False)
     context = sanitize_linking_context(context)
     return df, merged_count, context
 
@@ -3395,7 +3340,10 @@ def link_entities_semantic(
     if progress_callback:
         progress_callback(0.05)
 
+    skip_types = {"PROP_VALUE", "MATERIAL_AMOUNT"}
     df = sanitized_input.copy()
+    excluded = df[df["entity_type"].astype(str).str.upper().isin(skip_types)].copy()
+    df = df[~df["entity_type"].astype(str).str.upper().isin(skip_types)].copy()
     df["norm"] = df["entity"].apply(normalize_entity)
     freq_map = Counter(df["norm"])
     unique_norms = tuple(sorted({norm for norm in df["norm"] if norm}))
@@ -3415,10 +3363,17 @@ def link_entities_semantic(
     if progress_callback:
         progress_callback(0.6)
 
+    base_threshold = 0.80
+    if len(df) > 0:
+        try:
+            base_threshold = 0.80 + min(0.05, 0.02 * math.log10(max(len(df) / 1000, 1e-6)))
+        except Exception:
+            base_threshold = 0.80
+
     canonical_map, alias_groups = _build_cluster_maps(
         unique_norms,
         similarity_lookup,
-        base_threshold=0.8,
+        base_threshold=base_threshold,
         abbreviation_links=abbreviation_links,
         freq_map=freq_map,
         type_lookup=type_lookup,
@@ -3440,6 +3395,14 @@ def link_entities_semantic(
 
     df = apply_user_canonical_overrides(df, user_canonical)
     df = sanitize_entity_dataframe(df)
+    if not excluded.empty:
+        if "norm" not in excluded.columns:
+            excluded["norm"] = excluded["entity"].apply(normalize_entity)
+        if "canonical" not in excluded.columns:
+            excluded["canonical"] = excluded["norm"]
+        if "Canonical" not in excluded.columns:
+            excluded["Canonical"] = excluded["canonical"].apply(lambda val: str(val).strip().upper())
+        df = pd.concat([df, excluded], ignore_index=True, sort=False)
     context = sanitize_linking_context(context)
     return df, merged_count, context
 
@@ -3704,6 +3667,12 @@ def process_abstracts(
 
     tokenizer = getattr(ner, "tokenizer", None)
     model = getattr(ner, "model", None)
+    torch_module = torch
+    if model is not None and hasattr(model, "eval"):
+        try:
+            model.eval()
+        except Exception:
+            pass
     if tokenizer is not None and model is not None and abbreviation_tokens:
         existing_tokens: Set[str] = set(getattr(tokenizer, "_ner_added_tokens", []))
         vocab = set()
@@ -3740,82 +3709,95 @@ def process_abstracts(
             if len(chunk_spec) > 1:
                 long_text_count += 1
             seen_spans: Set[Tuple[int, int, str]] = set()
-            for chunk in chunk_spec:
-                chunk_text_str = chunk.get("text", "")
-                chunk_start_char = int(chunk.get("start_char", 0))
-                if tokenizer is not None:
-                    input_ids = tokenizer(chunk_text_str, add_special_tokens=True)["input_ids"]
-                    if len(input_ids) > 512:
-                        chunk_text_str = tokenizer.convert_tokens_to_string(
-                            tokenizer.tokenize(chunk_text_str)[:510]
-                        )
+            no_grad_ctx = torch_module.no_grad() if torch_module is not None else contextlib.nullcontext()
+            with no_grad_ctx:
+                for chunk in chunk_spec:
+                    chunk_text_str = chunk.get("text", "")
+                    chunk_start_char = int(chunk.get("start_char", 0))
+                    global_start = 0
+                    global_end = 0
+                    if tokenizer is not None:
                         input_ids = tokenizer(chunk_text_str, add_special_tokens=True)["input_ids"]
                         if len(input_ids) > 512:
+                            chunk_text_str = tokenizer.convert_tokens_to_string(
+                                tokenizer.tokenize(chunk_text_str)[:510]
+                            )
+                            input_ids = tokenizer(chunk_text_str, add_special_tokens=True)["input_ids"]
+                            if len(input_ids) > 512:
+                                continue
+                    predictions = ner_callable(chunk_text_str) or []
+                    for prediction in predictions:
+                        scores_raw = prediction.get("scores")
+                        if scores_raw and torch_module is not None:
+                            try:
+                                tensor_scores = torch_module.tensor(scores_raw, dtype=torch_module.float32)
+                                probs = torch_module.nn.functional.softmax(tensor_scores, dim=-1)
+                                prediction["score"] = float(probs.max().item())
+                            except Exception:
+                                pass
+                    for prediction in predictions:
+                        start_local = int(prediction.get("start", 0))
+                        end_local = int(prediction.get("end", 0))
+                        global_start = chunk_start_char + start_local
+                        global_end = chunk_start_char + end_local
+                        if global_start >= global_end:
                             continue
-                predictions = ner_callable(chunk_text_str) or []
-                for prediction in predictions:
-                    start_local = int(prediction.get("start", 0))
-                    end_local = int(prediction.get("end", 0))
-                    global_start = chunk_start_char + start_local
-                    global_end = chunk_start_char + end_local
-                    if global_start >= global_end:
-                        continue
-                    word = normalize_text(abstract[global_start:global_end])
-                    if not word:
-                        continue
-                    span_key = (global_start, global_end, word.lower())
-                    if span_key in seen_spans:
-                        continue
-                    seen_spans.add(span_key)
+                        word = normalize_text(abstract[global_start:global_end])
+                        if not word:
+                            continue
+                        span_key = (global_start, global_end, word.lower())
+                        if span_key in seen_spans:
+                            continue
+                        seen_spans.add(span_key)
 
-                    score = float(prediction.get("score", 0.0))
-                    candidate_type = map_entity_type(prediction.get("entity_group"), word)
-                    normalized_key = word.lower().strip()
+                        score = float(prediction.get("score", 0.0)) if isinstance(prediction, dict) else 0.0
+                        candidate_type = map_entity_type(prediction.get("entity_group"), word)
+                        normalized_key = word.lower().strip()
 
-                    domain_hint = domain_category_for(normalized_key) or domain_category_for(word)
-                    if not domain_hint and normalized_key.replace("-", " ") != normalized_key:
-                        domain_hint = domain_category_for(normalized_key.replace("-", " "))
-                    if domain_hint and (score < 0.7 or candidate_type in {"UNKNOWN", "O"}):
-                        candidate_type = domain_hint
-                        score = max(score, max(confidence_threshold + 0.05, 0.75))
+                        domain_hint = domain_category_for(normalized_key) or domain_category_for(word)
+                        if not domain_hint and normalized_key.replace("-", " ") != normalized_key:
+                            domain_hint = domain_category_for(normalized_key.replace("-", " "))
+                        if domain_hint and (score < 0.7 or candidate_type in {"UNKNOWN", "O"}):
+                            candidate_type = domain_hint
+                            score = max(score, max(confidence_threshold + 0.05, 0.75))
 
-                    abbr_hint = abbreviation_type_hints.get(normalized_key)
-                    if abbr_hint and (
-                        candidate_type in {"UNKNOWN", "O"} or score < 0.7
-                    ):
-                        candidate_type = abbr_hint
-                        score = max(score, max(confidence_threshold + 0.05, 0.75))
+                        abbr_hint = abbreviation_type_hints.get(normalized_key)
+                        if abbr_hint and (
+                            candidate_type in {"UNKNOWN", "O"} or score < 0.7
+                        ):
+                            candidate_type = abbr_hint
+                            score = max(score, max(confidence_threshold + 0.05, 0.75))
 
-                    if candidate_type not in ENTITY_TYPES:
-                        candidate_type = "UNKNOWN"
+                        if candidate_type not in ENTITY_TYPES:
+                            candidate_type = "UNKNOWN"
 
-                    if score < confidence_threshold:
-                        continue
-                    entity_type = candidate_type if candidate_type in ENTITY_TYPES else "UNKNOWN"
+                        if score < confidence_threshold:
+                            continue
+                        entity_type = candidate_type if candidate_type in ENTITY_TYPES else "UNKNOWN"
 
-                    if entity_type not in entity_set:
-                        entity_set[entity_type] = set()
-                        entity_map[entity_type] = []
-                        normalized_map[entity_type] = []
-                    if normalized_key in entity_set[entity_type]:
-                        continue
-                    entity_set[entity_type].add(normalized_key)
-                    entity_map[entity_type].append(word)
-                    normalized_map[entity_type].append(normalized_key)
-                    all_entities.add(word)
-                    all_entities_normalized.add(normalized_key)
-                    entity_rows.append(
-                        {
-                            "paper_id": paper_id,
-                            "entity": word,
-                            "entity_norm": normalized_key,
-                            "entity_type": entity_type,
-                            "confidence": round(score, 4),
-                            "is_unknown": entity_type == "UNKNOWN",
-                            "start": global_start,
-                            "end": global_end,
-                        }
-                    )
+                        if entity_type not in entity_set:
+                            entity_set[entity_type] = set()
+                            entity_map[entity_type] = []
+                            normalized_map[entity_type] = []
+                        if normalized_key in entity_set[entity_type]:
+                            continue
+                        entity_set[entity_type].add(normalized_key)
+                        entity_map[entity_type].append(word)
+                        normalized_map[entity_type].append(normalized_key)
+                        all_entities.add(word)
+                        all_entities_normalized.add(normalized_key)
+                        entity_rows.append(
+                            {
+                                "paper_id": paper_id,
+                                "entity": word,
+                                "entity_norm": normalized_key,
+                                "entity_type": entity_type,
+                                "confidence": round(score, 4),
+                                "is_unknown": entity_type == "UNKNOWN",
+                                "start": global_start,
+                                "end": global_end,
+                            }
+                        )
 
         existing_norms = {row["entity_norm"] for row in entity_rows if row["paper_id"] == paper_id}
         for abbr_norm, expansion in abbreviation_registry.get(paper_id, {}).items():
@@ -3891,10 +3873,16 @@ def process_abstracts(
         for entity_type in ENTITY_TYPES:
             augmented_row[entity_type] = entity_map[entity_type]
             augmented_row[f"{entity_type} Normalized"] = normalized_map[entity_type]
-        augmented_row["All Entities"] = sorted(all_entities)
-        augmented_row["All Entities Normalized"] = sorted(all_entities_normalized)
-        augmented_row["Entity Map"] = entity_map
-        augmented_rows.append(augmented_row)
+            augmented_row["All Entities"] = sorted(all_entities)
+            augmented_row["All Entities Normalized"] = sorted(all_entities_normalized)
+            augmented_row["Entity Map"] = entity_map
+            augmented_rows.append(augmented_row)
+
+        if torch_module is not None and hasattr(torch_module, "cuda") and getattr(torch_module.cuda, "is_available", lambda: False)():
+            try:
+                torch_module.cuda.empty_cache()
+            except Exception:
+                pass
 
         if progress is not None:
             progress.progress(
@@ -3910,13 +3898,15 @@ def process_abstracts(
         entity_df["paper_id"] = entity_df["paper_id"].astype(int)
         entity_df = entity_df.sort_values(["paper_id", "entity_type", "entity"]).reset_index(drop=True)
         entity_df = merge_acronym_variants(entity_df)
+        char_mask = entity_df["entity"].astype(str).str.fullmatch(r"\s*[A-Za-z0-9]\s*")
+        keep_mask = ~char_mask | entity_df.get("is_user_entity", False)
+        entity_df = entity_df[keep_mask].reset_index(drop=True)
     augmented_df = sanitize_processed_dataframe(
         augmented_df,
         allow_empty_abstracts=ALLOW_EMPTY_ABSTRACTS,
         drop_duplicates=ENABLE_DEDUPLICATION,
     )
     entity_df = sanitize_entity_dataframe(entity_df)
-    entity_df = correct_unit_mislabels(entity_df)
     entity_df = filter_false_units(entity_df)
     entity_df = suppress_lonely_units(entity_df)
     entity_df = trim_and_filter_entities(entity_df)
@@ -3929,7 +3919,6 @@ def process_abstracts(
         drop_duplicates=ENABLE_DEDUPLICATION,
     )
     entity_df = sanitize_entity_dataframe(entity_df)
-    entity_df = correct_unit_mislabels(entity_df)
     entity_df = trim_and_filter_entities(entity_df)
 
     if progress is not None:
@@ -3954,9 +3943,9 @@ def filter_dataframe(
     if not working_df.empty:
         working_df["paper_id"] = working_df["paper_id"].astype(int)
 
-    allowed_types = set(selected_types) if selected_types else set(ENTITY_TYPES)
+    allowed_types = set(selected_types) if selected_types else set(ENTITY_TYPES) | set(CUSTOM_ENTITY_TYPES)
     if not allowed_types:
-        allowed_types = set(ENTITY_TYPES)
+        allowed_types = set(ENTITY_TYPES) | set(CUSTOM_ENTITY_TYPES)
 
     working_entity_df = entity_df.copy()
     if "canonical" not in working_entity_df.columns and not working_entity_df.empty:
@@ -4254,8 +4243,11 @@ def display_results(
         confident_entity_df = entity_df
         hidden_count = 0
     else:
-        uncertain_mask = (entity_df["confidence"] < confidence_threshold) | (
-            entity_df["entity_type"] == "UNKNOWN"
+        user_mask = entity_df.get("is_user_entity", False).astype(bool)
+        # FIXED: allow custom user entities to bypass confidence/UNKNOWN filtering for display tables
+        uncertain_mask = (~user_mask) & (
+            (entity_df["confidence"] < confidence_threshold)
+            | (entity_df["entity_type"] == "UNKNOWN")
         )
         if show_uncertain:
             confident_entity_df = entity_df
@@ -4418,8 +4410,8 @@ def display_results(
     ):
         st.dataframe(pvu_df, use_container_width=True)
         st.info(
-            f"✅ Found {len(pvu_df)} Property–Value–Unit triples "
-            f"across {pvu_df['paper_id'].nunique()} papers."
+            f"✅ Found {len(pvu_df)} property/value records "
+            f"across {pvu_df['Source'].nunique()} papers."
         )
     else:
         st.warning("No Property–Value–Unit triples detected.")
@@ -4428,7 +4420,10 @@ def display_results(
     for paper_id, group in visible_entities.groupby("paper_id"):
         type_map: Dict[str, List[str]] = {}
         for entity_type, subset in group.groupby("entity_type"):
-            values = sorted({str(val).strip() for val in subset.get("Canonical", []) if str(val).strip()})
+            source_series = subset["Canonical"] if "Canonical" in subset.columns else subset.get("entity", [])
+            values = sorted({str(val).strip() for val in source_series if str(val).strip()})
+            if not values and "entity" in subset.columns:
+                values = sorted({str(val).strip() for val in subset["entity"] if str(val).strip()})
             if values:
                 normalized_values = deep_clean(values)
                 if not _should_keep(normalized_values):
@@ -4465,6 +4460,28 @@ def display_results(
         else:
             st.info("No entities match your current filter.")
     else:
+        detailed_entities = visible_entities.copy()
+        if "Canonical_Entity" not in detailed_entities.columns:
+            if "Canonical" in detailed_entities.columns:
+                detailed_entities["Canonical_Entity"] = detailed_entities["Canonical"]
+            elif "entity" in detailed_entities.columns:
+                detailed_entities["Canonical_Entity"] = detailed_entities["entity"]
+        if "entity" in detailed_entities.columns and "Entity_Text" not in detailed_entities.columns:
+            detailed_entities["Entity_Text"] = detailed_entities["entity"]
+        if "entity_type" in detailed_entities.columns and "Entity_Type" not in detailed_entities.columns:
+            detailed_entities["Entity_Type"] = detailed_entities["entity_type"]
+        if {"Canonical_Entity", "Entity_Text", "Entity_Type"}.issubset(detailed_entities.columns):
+            detailed_entities["Canonical_Entity"] = detailed_entities.apply(
+                lambda row: row["Entity_Text"]
+                if row["Entity_Type"] in ["PROP_VALUE", "MATERIAL_AMOUNT"]
+                and (
+                    row["Canonical_Entity"] is None
+                    or str(row["Canonical_Entity"]).strip() == ""
+                    or str(row["Canonical_Entity"]).lower() == "none"
+                )
+                else row["Canonical_Entity"],
+                axis=1,
+            )
         display_cols = [
             col
             for col in [
@@ -4473,11 +4490,12 @@ def display_results(
                 "Canonical",
                 "entity_type",
                 "confidence",
+                "Canonical_Entity",
             ]
-            if col in visible_entities.columns
+            if col in detailed_entities.columns
         ]
         st.dataframe(
-            sanitize_entities_output(visible_entities[display_cols]),
+            sanitize_entities_output(detailed_entities[display_cols]),
             use_container_width=True,
         )
 
@@ -4486,7 +4504,13 @@ def display_results(
         return
 
     st.subheader("Detailed View")
-    max_rows = min(len(filtered_df), 50)
+    detail_df = filtered_df.copy()
+    for subset_cols in (["DOI", "Title", "Abstract"], ["paper_id", "Title", "Abstract"], ["paper_id"]):
+        existing = [col for col in subset_cols if col in detail_df.columns]
+        if existing:
+            detail_df = detail_df.drop_duplicates(subset=existing, keep="first")
+            break
+    max_rows = min(len(detail_df), 50)
     if max_rows == 0:
         st.info("Adjust filters or lower the confidence threshold to view results.")
         return
@@ -4502,7 +4526,7 @@ def display_results(
             step=1,
         )
 
-    for _, row in filtered_df.head(row_limit).iterrows():
+    for _, row in detail_df.head(row_limit).iterrows():
         with st.container():
             title = row.get("Title") or "Untitled"
             st.markdown(safe_to_str(f"### {title}"))
@@ -4517,6 +4541,18 @@ def display_results(
                 st.markdown(safe_to_str(" | ".join(meta_bits)))
             paper_entities_raw = paper_entity_lookup.get(row.get("paper_id"), {})
             paper_entities = deep_clean(paper_entities_raw) if paper_entities_raw else {}
+            # --- Fix PROP_VALUE / MATERIAL_AMOUNT canonical None issue safely ---
+            if isinstance(paper_entities, dict):
+                fixed_entities = {}
+                for label, entity_value in paper_entities.items():
+                    if label in ["PROP_VALUE", "MATERIAL_AMOUNT"]:
+                        if entity_value is None or str(entity_value).strip().lower() in ["", "none", "nan"]:
+                            fixed_entities[label] = label
+                        else:
+                            fixed_entities[label] = entity_value
+                    else:
+                        fixed_entities[label] = entity_value
+                paper_entities = fixed_entities
             if not isinstance(paper_entities, dict) or not _should_keep(paper_entities):
                 paper_entities = {}
             chips_html = render_entity_chips(paper_entities)
@@ -5438,7 +5474,7 @@ def main():
             entity_df = apply_canonical_merge_map(entity_df, merge_map_active)
             processed_df = apply_canonical_merges_to_processed_df(processed_df, merge_map_active)
             entity_df = sanitize_entity_dataframe(entity_df)
-            entity_df = correct_unit_mislabels(entity_df)
+            
             entity_df = trim_and_filter_entities(entity_df)
             processed_df = sanitize_processed_dataframe(
                 processed_df,

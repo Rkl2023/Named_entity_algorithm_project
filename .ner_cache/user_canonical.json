@@ -1,20 +1,10 @@
 {
   "user_canonical": {
-    "SIDE CHAIN": [
+    "side chain": [
       "side-chain",
       "side-chain engineering",
       "side chain",
       "side chain engineering"
-    ],
-    "OFET": [
-      "ORGANIC FIELD EFFECT TRANSISTOR"
-    ],
-    "OECT": [
-      "ORGANIC ELECTROCHEMICAL TRANSISTOR"
-    ],
-    "OPV": [
-      "PHOTOVOLTAIC",
-      "ORGANIC SOLAR CELL"
     ]
   }
 }

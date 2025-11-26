@@ -1,20 +1,16 @@
 {
   "user_entities": [
     {
+      "term": "HOMO energy level",
+      "type": "PROP_NAME"
+    },
+    {
       "term": "polymer",
-      "type": "MATERIAL"
+      "type": "POLYMER"
     },
     {
-      "term": "device",
-      "type": "MATERIAL"
-    },
-    {
-      "term": "organic solar cell",
-      "type": "MATERIAL"
-    },
-    {
-      "term": "photovoltaics",
-      "type": "MATERIAL"
+      "term": "homo",
+      "type": "PROP_NAME"
     }
   ]
 }
