@@ -11,7 +11,7 @@ An interactive Streamlit application for mining scientific literature with pretr
 
 ## Quick Start
 ```bash
-git clone https://github.com/k25063738/Named_entity_algorithm_project
+git clone https://github.com/k25063738/Named_entity_algorithm_project](https://github.com/Rkl2023/Named_entity_algorithm_project.git
 cd Named_entity_algorithm_project
 python3 install.py
 source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
